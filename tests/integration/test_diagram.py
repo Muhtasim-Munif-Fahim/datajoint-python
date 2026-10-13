@@ -1,4 +1,9 @@
+import json
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest as _pytest
 
@@ -17,6 +22,47 @@ def test_master_part_entity_cluster(schema_simp):
     texts = re.findall(r"<text[^>]*>([^<]+)</text>", svg)
     assert "C" in texts, "part B.C should display as 'C' (master prefix dropped)"
     assert "B.C" not in texts, "the part label must not include the master prefix"
+
+
+_RENDER_SCRIPT = """
+import json, sys
+import datajoint as dj
+from tests import schema_simple
+
+creds, schema_name, out_path = json.loads(sys.argv[1]), sys.argv[2], sys.argv[3]
+schema = dj.Schema(schema_name, schema_simple.LOCALS_SIMPLE, connection=dj.Connection(**creds))
+for name in ("A", "B", "L", "D", "E", "G", "Website", "Profile"):
+    schema(getattr(schema_simple, name))
+diagram = dj.Diagram(schema, context=schema_simple.LOCALS_SIMPLE)
+with open(out_path, "w") as f:
+    f.write(diagram.make_dot().create_svg().decode())
+    f.write(diagram.make_mermaid())
+"""
+
+
+def test_diagram_output_independent_of_hash_seed(schema_simp, db_creds_test, prefix, tmp_path):
+    """The rendered diagram must not depend on set iteration order (#1551).
+
+    Table names are strings, whose hashes are salted per process, so this is
+    only observable across processes started with different PYTHONHASHSEED.
+    """
+    if not dj.diagram.diagram_active:
+        _pytest.skip("networkx/pydot not available")
+    repo_root = Path(__file__).resolve().parents[2]
+    outputs = []
+    for seed in ("0", "1", "2", "3"):
+        out_path = tmp_path / f"diagram_{seed}.txt"
+        env = dict(os.environ, PYTHONHASHSEED=seed, PYTHONPATH=str(repo_root))
+        subprocess.run(
+            [sys.executable, "-c", _RENDER_SCRIPT, json.dumps(db_creds_test), prefix + "_relational", str(out_path)],
+            check=True,
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+        )
+        outputs.append(out_path.read_text())
+    assert "cluster_entity_" in outputs[0]
+    assert all(out == outputs[0] for out in outputs[1:])
 
 
 def test_decorator(schema_simp):

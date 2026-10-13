@@ -1206,8 +1206,10 @@ class Diagram(nx.MultiDiGraph):  # noqa: C901
         # primary-key attribute of their own beyond what they inherit through
         # foreign keys. These are drawn with an underlined label. ("Schema
         # dimension" / "axis" is the documented term for such a table.)
-        # Filter nodes_to_show to only include nodes that exist in the graph
-        valid_nodes = self.nodes_to_show.intersection(set(self.nodes()))
+        # Filter nodes_to_show to only include nodes that exist in the graph.
+        # Keep the graph's own node order: nodes_to_show is a set of strings, so
+        # iterating it would make the emitted order depend on PYTHONHASHSEED.
+        valid_nodes = [n for n in self.nodes() if n in self.nodes_to_show]
         for name in valid_nodes:
             foreign_attributes = set(
                 attr for p in self.in_edges(name, data=True) for attr in p[2]["attr_map"] if p[2]["primary"]
@@ -1220,7 +1222,16 @@ class Diagram(nx.MultiDiGraph):  # noqa: C901
         # FK alongside a direct one) survive to the renderer as distinct edges.
         # Subgraph a plain MultiDiGraph copy — subgraphing/copying Diagram itself
         # would try to instantiate Diagram() (which requires a `source`).
-        graph = nx.MultiDiGraph(nx.MultiDiGraph(self).subgraph(valid_nodes))
+        # The graph is built node by node and edge by edge rather than with
+        # subgraph(), whose views iterate an internal set of the selected nodes
+        # when they are fewer than half the graph, so the output order (and the
+        # SVG/Mermaid emitted from it) would again vary between processes.
+        valid = set(valid_nodes)
+        graph = nx.MultiDiGraph(**self.graph)
+        graph.add_nodes_from((n, dict(self.nodes[n])) for n in valid_nodes)
+        graph.add_edges_from(
+            (u, v, k, dict(d)) for u, v, k, d in self.edges(keys=True, data=True) if u in valid and v in valid
+        )
         nx.set_node_attributes(graph, name="node_type", values={n: _get_tier(n) for n in graph})
         # relabel nodes to class names
         mapping = {node: lookup_class_name(node, self.context) or node for node in graph.nodes()}
@@ -1270,7 +1281,8 @@ class Diagram(nx.MultiDiGraph):  # noqa: C901
 
         # Group collapsed nodes by schema
         collapsed_by_schema = {}  # schema_name -> list of class_names
-        for class_name in nodes_to_collapse:
+        # walk the graph rather than the set so the grouping order is stable
+        for class_name in (n for n in graph.nodes() if n in nodes_to_collapse):
             full_name = class_to_full.get(class_name)
             if full_name:
                 schema_name, _ = self._connection.adapter.split_full_table_name(full_name)
@@ -1587,11 +1599,11 @@ class Diagram(nx.MultiDiGraph):  # noqa: C901
         key_by_stripped = {k.strip('"'): k for k in graph.nodes()}
 
         def _master_of(part_stripped):
-            candidates = set()
+            candidates = []
             if "." in part_stripped:
-                candidates.add(part_stripped.rsplit(".", 1)[0])  # class: Master.Part -> Master
+                candidates.append(part_stripped.rsplit(".", 1)[0])  # class: Master.Part -> Master
             if "__" in part_stripped:
-                candidates.add(part_stripped.rsplit("__", 1)[0])  # table: ...master__part -> ...master
+                candidates.append(part_stripped.rsplit("__", 1)[0])  # table: ...master__part -> ...master
             for candidate in candidates:
                 if candidate in key_by_stripped:
                     return candidate
@@ -1747,7 +1759,9 @@ class Diagram(nx.MultiDiGraph):  # noqa: C901
                 node_by_name = {n.get_name().strip('"'): n for n in nodes}
                 # masters in this schema that have at least one part present
                 masters_here = {}
-                for pn in part_names:
+                # iterate the dict (graph order), not the part_names set, so the
+                # entity clusters are emitted in the same order in every process
+                for pn in part_master:
                     mn = part_master[pn]
                     if pn in node_by_name and mn in node_by_name:
                         masters_here.setdefault(mn, []).append(pn)
